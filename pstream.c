@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <getopt.h>
 #include <pthread.h>
+#include <sys/types.h>
 #include <sys/time.h>
 #include <unistd.h>
 #include <float.h>
@@ -38,13 +39,15 @@
 
  Please send results, and machine config (number and type of cpu's, amount
  and type of ram) to bill@cse.ucdavis.edu
+ 
+ Bugfixes and using conf info instead of consts by Shay Gal-On
+ 
 */
 
 #define REPEAT 1
 #define BENCHMARKS 2
-#define MAX_THREADS 244
+#define MAX_THREADS 1024
 #define MAX_ITER 256
-#define CPUS 64
 
 struct idThreadParams {
 	int id;
@@ -56,9 +59,9 @@ double timeAr[MAX_THREADS][BENCHMARKS * 2];
 
 static int shared_cache = 0;
 int minMemory = 500 * 1024 * 1024;
-int64_t maxMemory = 512 * 1024 * 1024;
+int64_t maxMemory = 2048ULL * 1024ULL * 1024ULL;
 double timeStep = 0.25;
-int cacheLineSize = 128;		  /* bytes per cacheline */
+int cacheLineSize = 64;		  /* bytes per cacheline */
 int64_t cacheSize = 32 * 1024;  /* q6600 = 4MB share per die, or 2MB per core */
 double increaseArray = 0.925;
 int band = 0;
@@ -71,8 +74,9 @@ int numPages = 1;
 int perCacheLine;
 int cacheLinesPerPage;
 int cur_threads;
+int spread=1;
 
-int64_t maxmem;
+int64_t maxmem=0, max_cpu=0;
 
 pthread_mutex_t syncera, syncerb, finisher, counter;
 pthread_mutexattr_t attrib;
@@ -235,16 +239,19 @@ follow_ar (int64_t * a, int64_t N, int repeat)
 
 #ifdef USEAFFINITY
 void
-set_affinity (struct idThreadParams id)
+set_affinity (struct idThreadParams *id)
 {
 	cpu_set_t cset;
 /*	printf ("id=%d affinity=%d affinity_wide=%d\n",id,affinity,affinity_wide); */
+	int aid=id->id;
+	// Allow spread at constant intervals.
+	if (affinity_wide && spread>1) {
+		aid= ((aid%spread) * max_cpu/spread) + aid/spread;
+	}
+	
 	sched_getaffinity (0, sizeof (cpu_set_t), &cset);
 	CPU_ZERO (&cset);
-	if (affinity_wide)
-		CPU_SET ((id.id % 2) * (id.maxThreads / 2) + (int) (id.id / 2), &cset);
-	else
-		CPU_SET (id.id, &cset);
+	CPU_SET (aid, &cset);
 	sched_setaffinity (0, sizeof (cpu_set_t), &cset);
 }
 #endif
@@ -261,7 +268,7 @@ latency_thread (void *arg)
 
 #ifdef USEAFFINITY
 	if (affinity)
-		set_affinity (*id);
+		set_affinity (id);
 #endif
 	size = maxmem / sizeof (int64_t);
 	if (usenuma)
@@ -465,7 +472,7 @@ print_bandwidth (char *str, struct idThreadParams id)
 }
 
 void
-bandwidth_time (double *times, double *results, int maxmem, int scale,
+bandwidth_time (double *times, double *results, int64_t maxmem, long long scale,
 					 int cur_threads)
 {
 	int i;
@@ -518,21 +525,29 @@ stream_thread (void *arg)
 
 #ifdef USEAFFINITY
 	if (affinity)
-		set_affinity (*id);
+		set_affinity (id);
 #endif
 	size = (maxmem / sizeof (double)) / 3;
 	if (usenuma)
 	{
 #ifdef USENUMA
-		numa_run_on_node (id->id % CPUS);
-#endif
-#ifdef VERBOSE
-		printf ("id=%d numa_id=%d\n", id->id, id->id % 2);
+		if (!affinity) { // use numa affinity binding 
+			pid_t pid=getpid();
+			int aid=id->id;
+			if (affinity_wide && spread>1) {
+				aid=((aid%spread) * max_cpu/spread) + aid/spread;
+			}
+			struct bitmask *pBM=numa_bitmask_alloc(numa_num_configured_cpus());
+			pBM=numa_bitmask_clearall(pBM);
+			pBM=numa_bitmask_setbit(pBM, aid);
+			numa_sched_setaffinity(pid,pBM);
+		}
+	//numa_run_on_node (id->id % CPUS);
 #endif
 		/* split the cache into thirds, and insure that each array maps
 		   into it's 3rd.  Helps quite a bit on shanhai. */
 #ifdef USENUMA
-		printf ("on cpu %d freeing %d\n",id->id);
+//		printf ("on cpu %d freeing %d\n",id->id);
 		aa =
 			(double *) numa_alloc_local (size * sizeof (double) + 2 * cacheSize +
 			2 * cacheLineSize);
@@ -784,8 +799,12 @@ main (int argc, char *argv[])
 	struct idThreadParams id;
 	struct idThreadParams tid[MAX_THREADS];
 
-   id.minThreads = 1;
-	id.maxThreads = 64;
+    id.minThreads = 1;
+	max_cpu=sysconf(_SC_NPROCESSORS_ONLN);
+	pageSize=sysconf(_SC_PAGESIZE);
+	cacheLineSize=sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+	cacheSize=sysconf(_SC_LEVEL3_CACHE_SIZE);
+	id.maxThreads = max_cpu;
 	perCacheLine = cacheLineSize / sizeof (int64_t);
 	cacheLinesPerPage = pageSize / cacheLineSize;
 	results[0] = 0;
@@ -802,7 +821,7 @@ main (int argc, char *argv[])
 	while (1)
 	{
    	int option_index = 0;
-		c= getopt_long (argc, argv, "AalbPUuc:f:M:m:i:n:p:r:s:t:T:z:v?h",long_options,&option_index);
+		c= getopt_long (argc, argv, "AalbPUuc:f:M:m:i:n:p:r:s:S:t:T:z:v?h",long_options,&option_index);
 		if (c == -1)
         break;
 		switch (c)
@@ -844,6 +863,9 @@ main (int argc, char *argv[])
 			break;
 		case 'c':
 			cacheSize = atoi (optarg) * 1024;
+			break;
+		case 'S':
+			spread = atoi (optarg) ;
 			break;
 		case 'f':
 			logfile = optarg;
@@ -1007,6 +1029,7 @@ main (int argc, char *argv[])
 				}
 				difft[i] = max - min;
 			}
+			if (difft[0] > 0 && difft[1]>0) {
 			diff = difft[0];
 			if (lat == 1)
 				latency_time (difft, results, maxmem, scale, cur_threads);
@@ -1016,6 +1039,7 @@ main (int argc, char *argv[])
 			bandwidthAr[logint (cur_threads)][num_array][1] = results[1];
 /*	      printf ("cur=%d index=%d\n", cur_threads, log[cur_threads]); */
 			printf ("\n");
+			}
 			array_size = array_size * increaseArray;
 			num_array++;
 		}
